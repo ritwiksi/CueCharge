@@ -1,0 +1,5 @@
+__pycache__/
+.streamlit/
+*.pyc
+.env
+sf_building_profiles.csv
