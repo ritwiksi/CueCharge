@@ -47,7 +47,7 @@ def demand_incentive(timestamps):
     even though a new peak built off-peak still gets billed at ANYTIME_DEMAND.
     """
     _, period_rate, _ = tariff_arrays(timestamps)
-    return period_rate + ANYTIME_DEMAND
+    return (period_rate + ANYTIME_DEMAND) / 20
 
 
 def compute_bill(timestamps, net_grid_kw):
