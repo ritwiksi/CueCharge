@@ -21,16 +21,34 @@ class LoadForecaster:
         self.model.fit(d[["h", "q", "d", "l1", "lw"]], d["load_kw"])
 
     def predict_24h(self, ts, history):
+        """Forecast the next 96 intervals using only observations before ts."""
         if len(history) < 96 * 7:
             raise ValueError("Need at least 7 days of history before forecasting")
-        l1 = history["load_kw"].tail(96).values
-        lw = history["load_kw"].tail(96 * 7).iloc[:96].values
+        indexed = history.set_index("timestamp")["load_kw"]
         preds = []
         for i in range(96):
             cur_ts = ts + pd.Timedelta(minutes=15 * i)
-            feat = [[cur_ts.hour, cur_ts.minute // 15, cur_ts.dayofweek, l1[i], lw[i]]]
+            try:
+                l1 = float(indexed.loc[cur_ts - pd.Timedelta(days=1)])
+                lw = float(indexed.loc[cur_ts - pd.Timedelta(days=7)])
+            except KeyError as exc:
+                raise ValueError(f"Missing historical load needed for forecast at {cur_ts}") from exc
+            feat = [[cur_ts.hour, cur_ts.minute // 15, cur_ts.dayofweek, l1, lw]]
             preds.append(self.model.predict(feat)[0])
         return np.maximum(np.asarray(preds), 0.0)
+
+
+def persistence_forecast(column, ts, history, horizon=96):
+    """Use the same timestamp from the previous day as a transparent baseline forecast."""
+    indexed = history.set_index("timestamp")[column]
+    values = []
+    for i in range(horizon):
+        target = ts + pd.Timedelta(minutes=15 * i) - pd.Timedelta(days=1)
+        try:
+            values.append(float(indexed.loc[target]))
+        except KeyError as exc:
+            raise ValueError(f"Missing historical {column} needed for forecast at {target}") from exc
+    return np.maximum(np.asarray(values), 0.0)
 
 
 class RollingBrain:
@@ -47,7 +65,7 @@ class RollingBrain:
         self.deg_cost = 0.02
 
     def solve_horizon(self, load_f, solar_f, price_f, demand_rate, terminal_soc=None):
-        """Optimize an arbitrary 15-minute horizon; caller executes only the first step."""
+        """Optimize a 15-minute horizon; the caller executes only the first step."""
         n = len(load_f)
         if not (len(solar_f) == len(price_f) == n):
             raise ValueError("Forecast arrays must have equal length")
@@ -81,7 +99,7 @@ class RollingBrain:
         A_ub.append(r_min)
         b_ub.append(np.full(n, self.soc - self.min_soc))
 
-        # Shared inverter limit: charging + discharging cannot exceed rated power.
+        # Shared inverter limit.
         r_power = np.zeros((n, n_vars))
         r_power[np.arange(n), c_idx] = 1
         r_power[np.arange(n), d_idx] = 1
@@ -102,8 +120,7 @@ class RollingBrain:
         A_ub.append(r_global_peak)
         b_ub.append(np.array([-self.peak_so_far]))
 
-        # Prevent the optimizer from emptying the battery just because the
-        # current horizon ends; preserve a usable reserve at the horizon end.
+        # Preserve a useful SOC at the end of the look-ahead horizon.
         if terminal_soc is None:
             terminal_soc = self.cap * 0.50
         terminal_soc = max(self.min_soc, min(self.cap, float(terminal_soc)))
@@ -125,7 +142,6 @@ class RollingBrain:
         return res.x[c_idx], res.x[d_idx]
 
     def solve_full_day(self, load_f, solar_f, price_f, demand_rate):
-        """Backward-compatible wrapper for a 24-hour optimization."""
         return self.solve_horizon(load_f, solar_f, price_f, demand_rate)
 
     def update_state(self, c, d, actual_net):
@@ -145,11 +161,10 @@ def fixed_rule_dispatch(load, solar, timestamps, cap, pwr, soc, eta=0.93):
 
     for i, ts in enumerate(timestamps):
         is_peak = 16 <= ts.hour < 21
-        is_offpeak = not is_peak
         if is_peak and current_soc > min_soc:
             available = min(pwr * 0.25 / eta, current_soc - min_soc)
             discharge[i] = min(pwr, available * eta / 0.25)
-        elif is_offpeak and current_soc < cap:
+        elif not is_peak and current_soc < cap:
             available = min(pwr * 0.25 * eta, cap - current_soc)
             charge[i] = min(pwr, available / (0.25 * eta))
         current_soc = max(
