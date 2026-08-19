@@ -3,5 +3,4 @@ __pycache__/
 *.pyc
 .env
 sf_building_profiles.csv
-# Add this line to your repo's .gitignore -- do NOT commit secrets.toml
-.streamlit/secrets.toml
+streamlit/secrets.toml
