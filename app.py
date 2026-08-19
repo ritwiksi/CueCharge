@@ -7,19 +7,21 @@ from data_utils import get_real_data_stack, recommend_bess_size
 from tariffs import tariff_arrays, compute_bill, ANYTIME_DEMAND
 
 st.set_page_config(page_title="CueCharge Dispatch", layout="wide")
-st.title("CueCharge: Battery Dispatch Backtest")
-st.caption("Historical simulation only — not a live battery controller.")
+st.title("CueCharge")
+st.caption("Forecast-informed battery dispatch backtest")
 
 with st.sidebar:
-    st.header("Site")
-    facility = st.selectbox("Building Profile", ["WarehouseNew2004", "HospitalNew2004", "SuperMarketNew2004", "QuickServiceRestaurantNew2004"])
+    st.header("Simulation")
+    facility = st.selectbox(
+        "Building Profile",
+        ["WarehouseNew2004", "HospitalNew2004", "SuperMarketNew2004", "QuickServiceRestaurantNew2004"],
+    )
     init_data = get_real_data_stack(facility, 1)
     rec_pwr, rec_cap = recommend_bess_size(init_data["load_kw"])
-    st.info(f"Peak: {np.max(init_data['load_kw']):.1f} kW | Suggested BESS: {rec_pwr:.0f} kW / {rec_cap:.0f} kWh")
     cap = st.number_input("BESS Capacity (kWh)", min_value=1.0, value=float(rec_cap))
     pwr = st.number_input("BESS Power (kW)", min_value=1.0, value=float(rec_pwr))
     sim_days = st.slider("Backtest Window (Days)", 7, 30, 14)
-    execute = st.button("RUN BACKTEST")
+    execute = st.button("RUN BACKTEST", type="primary")
 
 if execute:
     data = get_real_data_stack(facility, sim_days + 14)
@@ -38,56 +40,79 @@ if execute:
         ts_start = day.iloc[0]["timestamp"]
         history = pd.concat([train_data, eval_data.iloc[:start]]).tail(14 * 96)
 
+        # Forecast only from information available before the simulated day.
         load_f = forecaster.predict_24h(ts_start, history)
         prices_f, d_rates_f, _ = tariff_arrays(day["timestamp"])
-
-        # Naive solar forecast: yesterday's 15-minute profile. No future leakage.
         solar_f = history["solar_kw"].tail(96).values
 
+        # Fixed-rule baseline: deterministic controller with no forecasting.
         b_charge, b_discharge = fixed_rule_dispatch(
-            day["load_kw"].values, day["solar_kw"].values, day["timestamp"], cap, pwr, baseline_soc
+            day["load_kw"].values,
+            day["solar_kw"].values,
+            day["timestamp"],
+            cap,
+            pwr,
+            baseline_soc,
         )
-        baseline_net = np.maximum(day["load_kw"].values - day["solar_kw"].values + b_charge - b_discharge, 0)
-        baseline_soc = max(0, min(cap, baseline_soc + b_charge.sum() * 0.25 * 0.93 - b_discharge.sum() * 0.25 / 0.93))
+        baseline_net = np.maximum(
+            day["load_kw"].values - day["solar_kw"].values + b_charge - b_discharge,
+            0,
+        )
+        baseline_soc = max(
+            0,
+            min(cap, baseline_soc + b_charge.sum() * 0.25 * 0.93 - b_discharge.sum() * 0.25 / 0.93),
+        )
 
-        # VPP revenue is intentionally excluded from the MVP.
-        c_charge, c_discharge = brain.solve_full_day(load_f, solar_f, prices_f, d_rates_f.max() + ANYTIME_DEMAND)
+        # CueCharge: forecast-informed optimization. VPP revenue is excluded.
+        c_charge, c_discharge = brain.solve_full_day(
+            load_f,
+            solar_f,
+            prices_f,
+            d_rates_f.max() + ANYTIME_DEMAND,
+        )
 
         for i in range(96):
-            actual_net = max(day.iloc[i]["load_kw"] - day.iloc[i]["solar_kw"] + c_charge[i] - c_discharge[i], 0)
+            actual_net = max(
+                day.iloc[i]["load_kw"] - day.iloc[i]["solar_kw"] + c_charge[i] - c_discharge[i],
+                0,
+            )
             brain.update_state(c_charge[i], c_discharge[i], actual_net)
-            results.append({
-                "Timestamp": day.iloc[i]["timestamp"],
-                "Raw_Net": max(day.iloc[i]["load_kw"] - day.iloc[i]["solar_kw"], 0),
-                "Baseline_Net": baseline_net[i],
-                "CueCharge_Net": actual_net,
-                "SoC": brain.soc,
-            })
+            results.append(
+                {
+                    "Timestamp": day.iloc[i]["timestamp"],
+                    "FixedRule_Net": baseline_net[i],
+                    "CueCharge_Net": actual_net,
+                }
+            )
 
     res_df = pd.DataFrame(results)
-    bill_unmanaged = compute_bill(res_df["Timestamp"], res_df["Raw_Net"])
-    bill_baseline = compute_bill(res_df["Timestamp"], res_df["Baseline_Net"])
+    bill_baseline = compute_bill(res_df["Timestamp"], res_df["FixedRule_Net"])
     bill_cue = compute_bill(res_df["Timestamp"], res_df["CueCharge_Net"])
+    savings = bill_baseline - bill_cue
+    savings_pct = (savings / bill_baseline * 100) if bill_baseline else 0
 
-    baseline_savings = bill_unmanaged - bill_baseline
-    cue_savings = bill_unmanaged - bill_cue
-    incremental_savings = bill_baseline - bill_cue
-
-    st.subheader("Financial Performance")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Unmanaged", f"${bill_unmanaged:,.0f}")
-    c2.metric("Fixed Rule", f"${bill_baseline:,.0f}", f"-${baseline_savings:,.0f}")
-    c3.metric("CueCharge", f"${bill_cue:,.0f}", f"-${cue_savings:,.0f}")
-    c4.metric("Incremental Value", f"${incremental_savings:,.0f}")
-
-    st.caption("The key metric is Incremental Value: CueCharge savings versus a customer who already owns and operates a battery with a fixed rule.")
+    st.subheader("Backtest Result")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Fixed Rule", f"${bill_baseline:,.0f}")
+    c2.metric("CueCharge", f"${bill_cue:,.0f}")
+    c3.metric("Savings", f"${savings:,.0f}", f"{savings_pct:.1f}%")
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=res_df["Timestamp"], y=res_df["Raw_Net"], name="Unmanaged"))
-    fig.add_trace(go.Scatter(x=res_df["Timestamp"], y=res_df["Baseline_Net"], name="Fixed Rule"))
-    fig.add_trace(go.Scatter(x=res_df["Timestamp"], y=res_df["CueCharge_Net"], name="CueCharge"))
-    fig.update_layout(template="plotly_dark", height=500, yaxis_title="Grid Load (kW)")
+    fig.add_trace(go.Scatter(
+        x=res_df["Timestamp"],
+        y=res_df["FixedRule_Net"],
+        name="Fixed Rule",
+    ))
+    fig.add_trace(go.Scatter(
+        x=res_df["Timestamp"],
+        y=res_df["CueCharge_Net"],
+        name="CueCharge",
+    ))
+    fig.update_layout(height=500, yaxis_title="Grid Load (kW)")
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Modeling caveats")
-    st.write("Building profiles are hourly and reconstructed to 15-minute resolution for this MVP. Solar is a PVWatts TMY3 simulation, not measured site weather. The demand-charge implementation is simplified and should not be presented as an official utility bill.")
+    st.caption(
+        "Savings = Fixed Rule bill − CueCharge bill. "
+        "Current backtest uses a simplified tariff and modeled building/solar data; "
+        "the next data upgrade will replace these with public 15-minute datasets."
+    )
