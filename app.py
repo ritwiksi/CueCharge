@@ -28,25 +28,18 @@ if execute:
         st.stop()
 
     data = get_real_data_stack(
-        building_id.strip(),
-        state,
-        latitude,
-        longitude,
-        sim_days + 21,
-        start="2018-01-01",
-        pv_capacity_kw=pv_capacity,
+        building_id.strip(), state, latitude, longitude, sim_days + 21,
+        start="2018-01-01", pv_capacity_kw=pv_capacity,
     )
 
     train_data = data.iloc[: 14 * 96].copy()
     eval_data = data.iloc[14 * 96 : (14 + sim_days) * 96].reset_index(drop=True)
-
     forecaster = LoadForecaster()
-    forecaster.train(train_data)
-    brain = RollingBrain(cap, pwr) if False else None
 
+    # Train only on the historical window available before the evaluation period.
+    forecaster.train(train_data)
     rec_pwr, rec_cap = recommend_bess_size(train_data["load_kw"])
-    cap = rec_cap
-    pwr = rec_pwr
+    cap, pwr = rec_cap, rec_pwr
     brain = RollingBrain(cap, pwr)
     baseline_soc = cap * 0.5
     results = []
@@ -57,12 +50,8 @@ if execute:
         day_ts = day["timestamp"].reset_index(drop=True)
 
         b_charge, b_discharge = fixed_rule_dispatch(
-            day["load_kw"].values,
-            day["solar_kw"].values,
-            day_ts,
-            cap,
-            pwr,
-            baseline_soc,
+            day["load_kw"].values, day["solar_kw"].values, day_ts,
+            cap, pwr, baseline_soc,
         )
         baseline_net = (day["load_kw"].values - day["solar_kw"].values + b_charge - b_discharge).clip(min=0)
         baseline_soc = max(
@@ -70,6 +59,7 @@ if execute:
             min(cap, baseline_soc + b_charge.sum() * 0.25 * 0.93 - b_discharge.sum() * 0.25 / 0.93),
         )
 
+        # Re-optimize every 15 minutes and execute only the first action.
         for i in range(96):
             ts = day_ts.iloc[i]
             history = pd.concat([train_data, eval_data.iloc[: start + i]])
@@ -79,15 +69,11 @@ if execute:
             prices_f, d_rates_f, _ = tariff_arrays(horizon_ts)
 
             c_plan, d_plan = brain.solve_horizon(
-                load_f,
-                solar_f,
-                prices_f,
-                d_rates_f.max() + ANYTIME_DEMAND,
+                load_f, solar_f, prices_f, d_rates_f.max() + ANYTIME_DEMAND,
             )
             c, d = float(c_plan[0]), float(d_plan[0])
             actual_net = max(day["load_kw"].iloc[i] - day["solar_kw"].iloc[i] + c - d, 0)
             brain.update_state(c, d, actual_net)
-
             results.append({"Timestamp": ts, "FixedRule_Net": baseline_net[i], "CueCharge_Net": actual_net})
 
     res_df = pd.DataFrame(results)
