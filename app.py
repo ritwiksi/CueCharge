@@ -12,10 +12,7 @@ st.caption("Historical simulation only — not a live battery controller.")
 
 with st.sidebar:
     st.header("Site")
-    facility = st.selectbox(
-        "Building Profile",
-        ["WarehouseNew2004", "HospitalNew2004", "SuperMarketNew2004", "QuickServiceRestaurantNew2004"],
-    )
+    facility = st.selectbox("Building Profile", ["WarehouseNew2004", "HospitalNew2004", "SuperMarketNew2004", "QuickServiceRestaurantNew2004"])
     init_data = get_real_data_stack(facility, 1)
     rec_pwr, rec_cap = recommend_bess_size(init_data["load_kw"])
     st.info(f"Peak: {np.max(init_data['load_kw']):.1f} kW | Suggested BESS: {rec_pwr:.0f} kW / {rec_cap:.0f} kWh")
@@ -44,46 +41,28 @@ if execute:
         load_f = forecaster.predict_24h(ts_start, history)
         prices_f, d_rates_f, _ = tariff_arrays(day["timestamp"])
 
-        # Weather/solar forecast is deliberately conservative for this MVP:
-        # use the same historical solar profile rather than future measured solar.
-        solar_f = day["solar_kw"].values
+        # Naive solar forecast: yesterday's 15-minute profile. No future leakage.
+        solar_f = history["solar_kw"].tail(96).values
 
-        # Fixed-rule battery baseline: no forecasting, no optimization.
         b_charge, b_discharge = fixed_rule_dispatch(
-            day["load_kw"].values,
-            day["solar_kw"].values,
-            day["timestamp"],
-            cap,
-            pwr,
-            baseline_soc,
+            day["load_kw"].values, day["solar_kw"].values, day["timestamp"], cap, pwr, baseline_soc
         )
         baseline_net = np.maximum(day["load_kw"].values - day["solar_kw"].values + b_charge - b_discharge, 0)
+        baseline_soc = max(0, min(cap, baseline_soc + b_charge.sum() * 0.25 * 0.93 - b_discharge.sum() * 0.25 / 0.93))
 
-        # CueCharge optimization. VPP revenue is intentionally excluded from the MVP.
-        c_charge, c_discharge = brain.solve_full_day(
-            load_f,
-            solar_f,
-            prices_f,
-            d_rates_f.max() + ANYTIME_DEMAND,
-        )
+        # VPP revenue is intentionally excluded from the MVP.
+        c_charge, c_discharge = brain.solve_full_day(load_f, solar_f, prices_f, d_rates_f.max() + ANYTIME_DEMAND)
 
         for i in range(96):
-            actual_net = day.iloc[i]["load_kw"] - day.iloc[i]["solar_kw"] + c_charge[i] - c_discharge[i]
-            actual_net = max(actual_net, 0)
+            actual_net = max(day.iloc[i]["load_kw"] - day.iloc[i]["solar_kw"] + c_charge[i] - c_discharge[i], 0)
             brain.update_state(c_charge[i], c_discharge[i], actual_net)
-            results.append(
-                {
-                    "Timestamp": day.iloc[i]["timestamp"],
-                    "Raw_Net": max(day.iloc[i]["load_kw"] - day.iloc[i]["solar_kw"], 0),
-                    "Baseline_Net": baseline_net[i],
-                    "CueCharge_Net": actual_net,
-                    "Baseline_Charge": b_charge[i],
-                    "Baseline_Discharge": b_discharge[i],
-                    "CueCharge_Charge": c_charge[i],
-                    "CueCharge_Discharge": c_discharge[i],
-                    "SoC": brain.soc,
-                }
-            )
+            results.append({
+                "Timestamp": day.iloc[i]["timestamp"],
+                "Raw_Net": max(day.iloc[i]["load_kw"] - day.iloc[i]["solar_kw"], 0),
+                "Baseline_Net": baseline_net[i],
+                "CueCharge_Net": actual_net,
+                "SoC": brain.soc,
+            })
 
     res_df = pd.DataFrame(results)
     bill_unmanaged = compute_bill(res_df["Timestamp"], res_df["Raw_Net"])
@@ -110,9 +89,5 @@ if execute:
     fig.update_layout(template="plotly_dark", height=500, yaxis_title="Grid Load (kW)")
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Important modeling caveats")
-    st.write(
-        "Building profiles are hourly and reconstructed to 15-minute resolution for this MVP. "
-        "Solar is based on a PVWatts TMY3 simulation, not measured site weather. "
-        "The demand-charge implementation is a simplified tariff model and should not be presented as an official utility bill."
-    )
+    st.subheader("Modeling caveats")
+    st.write("Building profiles are hourly and reconstructed to 15-minute resolution for this MVP. Solar is a PVWatts TMY3 simulation, not measured site weather. The demand-charge implementation is simplified and should not be presented as an official utility bill.")
