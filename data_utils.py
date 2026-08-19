@@ -1,72 +1,113 @@
-import pandas as pd
-import numpy as np
-import requests
-import glob
 import os
+import glob
+import numpy as np
+import pandas as pd
+import requests
 import streamlit as st
 
-# NREL Secrets
+
 try:
     NREL_API_KEY = st.secrets["NREL_API_KEY"]
 except Exception:
-    NREL_API_KEY = os.getenv("NREL_API_KEY", "DEMO_KEY")
+    NREL_API_KEY = os.getenv("NREL_API_KEY")
+
+
+def _pvwatts_solar_hourly(system_cap, days):
+    """Return a July TMY3 solar slice aligned to our July simulation dates."""
+    if not NREL_API_KEY:
+        return None
+
+    url = "https://developer.nrel.gov/api/pvwatts/v8.json"
+    params = {
+        "api_key": NREL_API_KEY,
+        "lat": 37.77,
+        "lon": -122.41,
+        "system_capacity": system_cap,
+        "azimuth": 180,
+        "tilt": 20,
+        "array_type": 1,
+        "module_type": 0,
+        "losses": 14,
+        "dataset": "tmy3",
+        "timeframe": "hourly",
+    }
+
+    response = requests.get(url, params=params, timeout=10)
+    response.raise_for_status()
+    outputs = response.json()["outputs"]
+    year = np.asarray(outputs["ac"], dtype=float)
+
+    # TMY3 is an annual representative year, not a July-only response.
+    # July starts at hour 434 in a non-leap year.
+    july_start = 181 * 24
+    return year[july_start:july_start + days * 24] / 1000.0
+
 
 def get_real_data_stack(building_column, days):
     """
-    Reconstructs 15-minute data using ComStock 2021 Variance Coefficients.
-    This provides the 'Jagged' peaks necessary for realistic BESS modeling.
+    Build a reproducible simulation dataset from hourly building profiles.
+
+    The building profiles are hourly. We reconstruct four 15-minute intervals
+    only so the demand-charge model has sub-hourly resolution. These are
+    synthetic sub-hourly values, NOT real 15-minute meter telemetry.
     """
-    # 1. LOAD HOURLY SKELETON
     csv_files = glob.glob("sf_building_profiles_lite.csv")
+    if not csv_files:
+        raise FileNotFoundError("sf_building_profiles_lite.csv not found")
+
     df_bldg = pd.read_csv(csv_files[0])
     df_bldg.columns = df_bldg.columns.str.strip()
-    load_hourly = df_bldg[building_column].values[:days*24]
-    
-    # 2. FETCH REAL SOLAR FROM NREL
-    system_cap = np.max(load_hourly) * 1.1
-    url = f"https://developer.nrel.gov/api/pvwatts/v8.json?api_key={NREL_API_KEY}&lat=37.77&lon=-122.41&system_capacity={system_cap}&azimuth=180&tilt=20&array_type=1&module_type=0&losses=14&dataset=tmy3&timeframe=hourly"
-    
-    try:
-        r = requests.get(url, timeout=10)
-        solar_hourly = np.array(r.json()['outputs']['ac'])[:days*24] / 1000.0
-    except:
-        hr = np.tile(np.arange(24), days)
-        solar_hourly = np.where((hr >= 6) & (hr <= 18), system_cap * np.sin(np.pi*(hr-6)/12), 0)
+    if building_column not in df_bldg.columns:
+        raise ValueError(f"Unknown building profile: {building_column}")
 
-    # 3. COMSTOCK 15-MIN RECONSTRUCTION
-    # Coefficients derived from NREL ComStock SF Warehouse/Hospital data (2021)
-    # This creates the 'Jagged' reality of real building telemetry.
+    load_hourly = df_bldg[building_column].astype(float).values[: days * 24]
+    if len(load_hourly) < days * 24:
+        raise ValueError("Building profile does not contain enough hourly data")
+
+    # Keep solar assumptions explicit rather than silently pretending the
+    # weather API is measured site telemetry.
+    system_cap = max(float(np.max(load_hourly)) * 0.5, 10.0)
+    try:
+        solar_hourly = _pvwatts_solar_hourly(system_cap, days)
+    except (requests.RequestException, KeyError, ValueError):
+        solar_hourly = None
+
+    if solar_hourly is None or len(solar_hourly) != days * 24:
+        hours = np.arange(days * 24) % 24
+        daylight = np.clip(np.sin(np.pi * (hours - 6) / 12), 0, None)
+        solar_hourly = system_cap * daylight
+
     variance_coeff = {
-        "WarehouseNew2004": 0.42,      # High motor/fan spikes
-        "HospitalNew2004": 0.12,       # Constant clinical equipment
-        "SuperMarketNew2004": 0.22,    # Refrigeration cycling
-        "QuickServiceRestaurantNew2004": 0.38 # Cooking equipment surges
+        "WarehouseNew2004": 0.42,
+        "HospitalNew2004": 0.12,
+        "SuperMarketNew2004": 0.22,
+        "QuickServiceRestaurantNew2004": 0.38,
     }.get(building_column, 0.20)
 
-    ti_hourly = pd.date_range("2024-07-01", periods=len(load_hourly), freq="h")
-    
-    fifteen_min_rows = []
-    for i in range(len(load_hourly)):
-        h_load = load_hourly[i]
-        
-        # We generate 4 sub-intervals. 
-        # They must sum to h_load (Energy Balance) but have ComStock variance (Peak Reality).
-        # We use a Log-Normal distribution to prevent negative loads.
-        raw_spikes = np.random.lognormal(mean=0, sigma=variance_coeff, size=4)
-        v_loads = (raw_spikes / np.sum(raw_spikes)) * h_load * 4
-        
-        for j in range(4):
-            fifteen_min_rows.append({
-                "timestamp": ti_hourly[i] + pd.Timedelta(minutes=15*j),
-                "load_kw": v_loads[j],
-                "solar_kw": solar_hourly[i]
-            })
+    # Fixed seed makes every backtest reproducible.
+    rng = np.random.default_rng(42)
+    timestamps = pd.date_range("2024-07-01", periods=days * 24, freq="h")
 
-    return pd.DataFrame(fifteen_min_rows)
+    rows = []
+    for i, h_load in enumerate(load_hourly):
+        raw_spikes = rng.lognormal(mean=0, sigma=variance_coeff, size=4)
+        # Preserve hourly energy while introducing synthetic 15-min shape.
+        quarter_loads = (raw_spikes / raw_spikes.sum()) * h_load * 4
+
+        for j, quarter_load in enumerate(quarter_loads):
+            rows.append(
+                {
+                    "timestamp": timestamps[i] + pd.Timedelta(minutes=15 * j),
+                    "load_kw": quarter_load,
+                    "solar_kw": solar_hourly[i],
+                }
+            )
+
+    return pd.DataFrame(rows)
+
 
 def recommend_bess_size(load):
-    peak = np.max(load)
-    # Sizing for the 15-min peak, not the hourly average
-    pwr = max(round(peak * 0.4, -1), 10.0) 
-    cap = pwr * 2 
+    peak = float(np.max(load))
+    pwr = max(round(peak * 0.4, -1), 10.0)
+    cap = pwr * 2
     return pwr, cap
