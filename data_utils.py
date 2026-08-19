@@ -17,39 +17,38 @@ def _pvwatts_solar_hourly(system_cap, days):
     if not NREL_API_KEY:
         return None
 
-    url = "https://developer.nrel.gov/api/pvwatts/v8.json"
-    params = {
-        "api_key": NREL_API_KEY,
-        "lat": 37.77,
-        "lon": -122.41,
-        "system_capacity": system_cap,
-        "azimuth": 180,
-        "tilt": 20,
-        "array_type": 1,
-        "module_type": 0,
-        "losses": 14,
-        "dataset": "tmy3",
-        "timeframe": "hourly",
-    }
-
-    response = requests.get(url, params=params, timeout=10)
+    response = requests.get(
+        "https://developer.nrel.gov/api/pvwatts/v8.json",
+        params={
+            "api_key": NREL_API_KEY,
+            "lat": 37.77,
+            "lon": -122.41,
+            "system_capacity": system_cap,
+            "azimuth": 180,
+            "tilt": 20,
+            "array_type": 1,
+            "module_type": 0,
+            "losses": 14,
+            "dataset": "tmy3",
+            "timeframe": "hourly",
+        },
+        timeout=10,
+    )
     response.raise_for_status()
-    outputs = response.json()["outputs"]
-    year = np.asarray(outputs["ac"], dtype=float)
+    year = np.asarray(response.json()["outputs"]["ac"], dtype=float)
 
-    # TMY3 is an annual representative year, not a July-only response.
-    # July starts at hour 434 in a non-leap year.
+    # PVWatts returns the TMY3 representative year. Align it with our July timestamps.
     july_start = 181 * 24
-    return year[july_start:july_start + days * 24] / 1000.0
+    # PVWatts AC output is already expressed as power for hourly results; do not divide by 1000.
+    return year[july_start : july_start + days * 24]
 
 
 def get_real_data_stack(building_column, days):
-    """
-    Build a reproducible simulation dataset from hourly building profiles.
+    """Build reproducible simulation data from hourly building profiles.
 
-    The building profiles are hourly. We reconstruct four 15-minute intervals
-    only so the demand-charge model has sub-hourly resolution. These are
-    synthetic sub-hourly values, NOT real 15-minute meter telemetry.
+    The source building profiles are hourly. We reconstruct four 15-minute
+    intervals only to give the demand-charge model sub-hourly resolution.
+    These sub-hourly values are synthetic, not real meter telemetry.
     """
     csv_files = glob.glob("sf_building_profiles_lite.csv")
     if not csv_files:
@@ -64,8 +63,7 @@ def get_real_data_stack(building_column, days):
     if len(load_hourly) < days * 24:
         raise ValueError("Building profile does not contain enough hourly data")
 
-    # Keep solar assumptions explicit rather than silently pretending the
-    # weather API is measured site telemetry.
+    # Solar capacity is an explicit MVP assumption, not a measured site property.
     system_cap = max(float(np.max(load_hourly)) * 0.5, 10.0)
     try:
         solar_hourly = _pvwatts_solar_hourly(system_cap, days)
@@ -84,16 +82,13 @@ def get_real_data_stack(building_column, days):
         "QuickServiceRestaurantNew2004": 0.38,
     }.get(building_column, 0.20)
 
-    # Fixed seed makes every backtest reproducible.
     rng = np.random.default_rng(42)
     timestamps = pd.date_range("2024-07-01", periods=days * 24, freq="h")
-
     rows = []
+
     for i, h_load in enumerate(load_hourly):
         raw_spikes = rng.lognormal(mean=0, sigma=variance_coeff, size=4)
-        # Preserve hourly energy while introducing synthetic 15-min shape.
         quarter_loads = (raw_spikes / raw_spikes.sum()) * h_load * 4
-
         for j, quarter_load in enumerate(quarter_loads):
             rows.append(
                 {
