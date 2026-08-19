@@ -1,162 +1,80 @@
-import glob
+import io
 import os
 
 import numpy as np
 import pandas as pd
 import requests
-import streamlit as st
 
-try:
-    NREL_API_KEY = st.secrets["NREL_API_KEY"]
-except Exception:
-    NREL_API_KEY = os.getenv("NREL_API_KEY")
+from nsrdb import fetch_nsrdb_5min, pv_from_irradiance
 
 
-def _pvwatts_solar_hourly(system_cap, days):
-    """Return the July TMY3 solar slice used by the legacy fallback."""
-    if not NREL_API_KEY:
-        return None
+COMSTOCK_BASE = (
+    "s3://oedi-data-lake/nrel-pds-building-stock/"
+    "end-use-load-profiles-for-us-building-stock/2025/comstock_amy2018_release_3"
+)
 
-    response = requests.get(
-        "https://developer.nrel.gov/api/pvwatts/v8.json",
-        params={
-            "api_key": NREL_API_KEY,
-            "lat": 37.77,
-            "lon": -122.41,
-            "system_capacity": system_cap,
-            "azimuth": 180,
-            "tilt": 20,
-            "array_type": 1,
-            "module_type": 0,
-            "losses": 14,
-            "dataset": "tmy3",
-            "timeframe": "hourly",
-        },
-        timeout=10,
+
+def _comstock_path(building_id, state, upgrade=0):
+    return (
+        f"{COMSTOCK_BASE}/timeseries_individual_buildings/by_state/"
+        f"upgrade={upgrade}/state={state}/{building_id}-{upgrade}.parquet"
     )
-    response.raise_for_status()
-    year = np.asarray(response.json()["outputs"]["ac"], dtype=float)
-    july_start = 181 * 24
-    return year[july_start : july_start + days * 24]
 
 
-def _load_comstock_15min(building_column, days):
-    """Load a local 15-minute ComStock/EULP export if one is available.
+def load_comstock_15min(building_id, state, days, start="2018-01-01"):
+    """Load one real ComStock AMY2018 individual-building 15-minute profile.
 
-    Expected format: a CSV or parquet file with a timestamp column and one or
-    more building-load columns in kW. Set COMSTOCK_15MIN_PATH to the file.
+    ComStock publishes individual building timeseries as kWh per 15-minute
+    interval. CueCharge converts that interval energy to average kW.
     """
-    path = os.getenv("COMSTOCK_15MIN_PATH")
-    if not path:
-        for candidate in ["comstock_15min.csv", "comstock_15min.parquet"]:
-            if os.path.exists(candidate):
-                path = candidate
-                break
-    if not path or not os.path.exists(path):
-        return None
-
-    if path.endswith(".parquet"):
-        df = pd.read_parquet(path)
-    else:
-        df = pd.read_csv(path)
-
-    df.columns = df.columns.str.strip()
-    timestamp_col = next((c for c in ["timestamp", "Timestamp", "time", "Time"] if c in df.columns), None)
-    if timestamp_col is None or building_column not in df.columns:
-        raise ValueError(
-            "15-minute ComStock file must contain a timestamp column and the selected building column."
-        )
-
-    out = pd.DataFrame(
-        {
-            "timestamp": pd.to_datetime(df[timestamp_col]),
-            "load_kw": pd.to_numeric(df[building_column], errors="coerce"),
-        }
-    ).dropna()
-    out = out.sort_values("timestamp").drop_duplicates("timestamp")
-    out = out.set_index("timestamp").resample("15min").mean().interpolate(limit=4).reset_index()
-    out = out.iloc[: days * 96].copy()
-    if len(out) < days * 96:
-        raise ValueError("15-minute ComStock file does not contain enough data for this backtest")
-    return out
-
-
-def get_real_data_stack(building_column, days):
-    """Build the backtest data stack.
-
-    Preferred path: a public 15-minute ComStock/EULP export supplied locally.
-    Legacy path: the compact hourly profile plus PVWatts, retained only so the
-    app remains runnable while the public 15-minute export is being downloaded.
-    """
-    comstock = _load_comstock_15min(building_column, days)
-    if comstock is not None:
-        # Solar remains a separate input until the historical NSRDB adapter is added.
-        system_cap = max(float(comstock["load_kw"].max()) * 0.5, 10.0)
-        solar_hourly = None
-        try:
-            solar_hourly = _pvwatts_solar_hourly(system_cap, int(np.ceil(days)))
-        except (requests.RequestException, KeyError, ValueError):
-            pass
-        if solar_hourly is None or len(solar_hourly) < days * 24:
-            solar_hourly = np.zeros(days * 24)
-        solar_index = pd.date_range(comstock["timestamp"].iloc[0].floor("h"), periods=len(solar_hourly), freq="h")
-        solar_df = pd.DataFrame({"timestamp": solar_index, "solar_kw": solar_hourly})
-        comstock["hour"] = comstock["timestamp"].dt.floor("h")
-        comstock = comstock.merge(solar_df, left_on="hour", right_on="timestamp", how="left", suffixes=("", "_solar"))
-        comstock["solar_kw"] = comstock["solar_kw"].fillna(0.0)
-        return comstock[["timestamp", "load_kw", "solar_kw"]].reset_index(drop=True)
-
-    # Legacy fallback only. This is deliberately deterministic and clearly separated
-    # from the real 15-minute ComStock path above.
-    csv_files = glob.glob("sf_building_profiles_lite.csv")
-    if not csv_files:
-        raise FileNotFoundError(
-            "No 15-minute ComStock file found. Add comstock_15min.csv/parquet or set COMSTOCK_15MIN_PATH."
-        )
-
-    df_bldg = pd.read_csv(csv_files[0])
-    df_bldg.columns = df_bldg.columns.str.strip()
-    if building_column not in df_bldg.columns:
-        raise ValueError(f"Unknown building profile: {building_column}")
-
-    load_hourly = df_bldg[building_column].astype(float).values[: days * 24]
-    if len(load_hourly) < days * 24:
-        raise ValueError("Building profile does not contain enough hourly data")
-
-    system_cap = max(float(np.max(load_hourly)) * 0.5, 10.0)
     try:
-        solar_hourly = _pvwatts_solar_hourly(system_cap, days)
-    except (requests.RequestException, KeyError, ValueError):
-        solar_hourly = None
+        import s3fs
+    except ImportError as exc:
+        raise RuntimeError("Install s3fs to read the public ComStock OEDI data lake.") from exc
 
-    if solar_hourly is None or len(solar_hourly) != days * 24:
-        hours = np.arange(days * 24) % 24
-        daylight = np.clip(np.sin(np.pi * (hours - 6) / 12), 0, None)
-        solar_hourly = system_cap * daylight
+    path = _comstock_path(str(building_id), str(state).upper())
+    fs = s3fs.S3FileSystem(anon=True)
+    if not fs.exists(path):
+        raise FileNotFoundError(
+            f"ComStock building file was not found: {path}. "
+            "Use a valid bldg_id/state from the 2025 Release 3 metadata."
+        )
 
-    rng = np.random.default_rng(42)
-    timestamps = pd.date_range("2024-07-01", periods=days * 24, freq="h")
-    rows = []
-    variance_coeff = {
-        "WarehouseNew2004": 0.42,
-        "HospitalNew2004": 0.12,
-        "SuperMarketNew2004": 0.22,
-        "QuickServiceRestaurantNew2004": 0.38,
-    }.get(building_column, 0.20)
+    table = pd.read_parquet(path, columns=["timestamp", "out.electricity.total.energy_consumption"], filesystem=fs)
+    if "out.electricity.total.energy_consumption" not in table.columns:
+        raise ValueError("ComStock file does not contain total electricity consumption.")
 
-    for i, h_load in enumerate(load_hourly):
-        raw_spikes = rng.lognormal(mean=0, sigma=variance_coeff, size=4)
-        quarter_loads = (raw_spikes / raw_spikes.sum()) * h_load * 4
-        for j, quarter_load in enumerate(quarter_loads):
-            rows.append(
-                {
-                    "timestamp": timestamps[i] + pd.Timedelta(minutes=15 * j),
-                    "load_kw": quarter_load,
-                    "solar_kw": solar_hourly[i],
-                }
-            )
+    out = table.rename(columns={"out.electricity.total.energy_consumption": "interval_kwh"})
+    out["timestamp"] = pd.to_datetime(out["timestamp"])
+    out["interval_kwh"] = pd.to_numeric(out["interval_kwh"], errors="coerce")
+    out = out.dropna(subset=["timestamp", "interval_kwh"]).sort_values("timestamp")
+    out = out.drop_duplicates("timestamp")
+    out["load_kw"] = out["interval_kwh"] / 0.25
 
-    return pd.DataFrame(rows)
+    start_ts = pd.Timestamp(start)
+    out = out[out["timestamp"] >= start_ts].iloc[: days * 96].copy()
+    if len(out) < days * 96:
+        raise ValueError(f"ComStock building has only {len(out)} usable 15-minute intervals after {start_ts.date()}; need {days * 96}.")
+    return out[["timestamp", "load_kw"]].reset_index(drop=True)
+
+
+def get_real_data_stack(building_id, state, latitude, longitude, days, start="2018-01-01", pv_capacity_kw=None):
+    """Build CueCharge's real-data stack from public ComStock + historical NSRDB."""
+    load = load_comstock_15min(building_id, state, days, start=start)
+
+    nsrdb = fetch_nsrdb_5min(latitude, longitude, year=pd.Timestamp(start).year)
+    solar = pv_from_irradiance(
+        nsrdb,
+        system_capacity_kw=pv_capacity_kw or max(float(load["load_kw"].max()) * 0.5, 10.0),
+    )
+    solar["timestamp"] = pd.to_datetime(solar["timestamp"])
+    solar = solar.set_index("timestamp").resample("15min").mean().reset_index()
+
+    out = load.merge(solar, on="timestamp", how="left")
+    out["solar_kw"] = out["solar_kw"].fillna(0.0)
+    if len(out) < days * 96:
+        raise ValueError("Historical NSRDB data does not cover the requested ComStock period.")
+    return out.iloc[: days * 96].reset_index(drop=True)
 
 
 def recommend_bess_size(load):
